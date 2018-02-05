@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -200,13 +201,19 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  double ref_vel = 0.1;//declare ref_vel here so that it's persistent across calls to onMessage; start with car stopped
+  double target_vel = 49.5 * 0.44704; //target velocity.  Can change quickly to match car ahead, and ref_vel will approach it with limited acceleration
+  int old_lane = 1; //lanes are 0,1,2 from left to right.  We start in lane 1
+  double ref_lane = 1.0; //tracks progress of lane change
+  int target_lane = 1;  //lane being moved into.  target_lane != old_lane denotes a lane changing state
+  h.onMessage([&ref_lane,&old_lane,&target_lane,&ref_vel,&target_vel,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
     //auto sdata = string(data).substr(0, length);
     //cout << sdata << endl;
+    cout<<"received request from simulator\n";
+
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
 
       auto s = hasData(data);
@@ -227,6 +234,7 @@ int main() {
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
 
+
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
@@ -237,28 +245,269 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
+                int prev_size = previous_path_x.size();
+                
           	json msgJson;
 
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+                //useful values for computation
+                double lane_width = 4.0; //lanes are 4 meters wide
+                double time_step = 0.02; //timestep is 0.02 seconds
+                double max_vel = 49.5 * 0.44704; //mph, convert to m/s
+                double max_accl_step = 0.15;
+                //non-persistent values for computation
+                double ref_accl_step = 0.0;
+                int change_dir = target_lane - old_lane;
 
+                cout <<"car_x,car_y are "<<car_x<<","<<car_y<<", ref_vel is "<<ref_vel<<", change_dir is "<<change_dir<<"\n";
+                
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
+
+                //PREDICT LOCATION OF ALL OTHER CARS AT OUR REFERENCE TIME POINT
+                double ref_s = car_s;
+                if(prev_size > 0){
+                  ref_s = end_path_s;
+                }
+                vector<double>others_id;
+                vector<double>others_s;
+                vector<double>others_pred_s;
+                vector<double> others_pred_d;
+                vector<double> others_speed;
+                for (int i = 0; i < sensor_fusion.size(); i++){ //iterate through all the other cars reported
+                  //each sensor_fusion entry is an array of id,x,y,vx,vy,s,d
+                  int    other_id = sensor_fusion[i][0];
+                  double other_vx = sensor_fusion[i][3];
+                  double other_vy = sensor_fusion[i][4];
+                  double other_s  = sensor_fusion[i][5];
+                  double other_d  = sensor_fusion[i][6];
+                  double other_speed = distance(0,0,other_vx,other_vy);
+                  others_id.push_back(other_id);
+                  others_s.push_back(other_s);
+                  other_s += ((double)prev_size * time_step * other_speed);//predict where other car will be at our ref point.  Assume car continues in its current lane
+                  others_pred_s.push_back(other_s);
+                  others_pred_d.push_back(other_d); //assume other car isn't moving laterally; we'll see how well this holds up
+                  others_speed.push_back(other_speed);
+                }
+
+                //CHECK LANES FOR CLOSE CARS; SET SPEED FOR EACH LANE; MARK IF SAFE TO ENTER LANE
+                vector<bool> lane_clear(3,true);
+                vector<double> lane_speed(3,max_vel);
+                vector<bool> way_too_close(3,false);
+                for (int i = 0; i < others_s.size(); i++){
+                  double other_d = others_pred_d[i];
+                  double other_s = others_s[i];
+                  double other_pred_s = others_pred_s[i];
+                  double other_speed = others_speed[i];
+                  int other_lane = (int)(other_d/lane_width);
+                  double other_dist = other_s - car_s;
+                  double other_pred_dist = other_pred_s - ref_s;
+                  if(other_dist > 0.0 && other_dist < 120.0){
+                  //if((other_dist > 0) && other_speed < ref_vel && other_speed < lane_speed[other_lane]){
+                    lane_speed[other_lane] = other_speed;
+                  }
+                  if(other_dist > 0.0 && other_dist < 15.0){
+                    way_too_close[other_lane] = true;
+                  }//if other within small distance
+                  if(other_pred_dist > -15.0 && other_pred_dist < 15.0){
+                    lane_clear[other_lane] = false;
+                  }
+                  //cout <<"  detected other car "<<others_id[i]<<" "<<other_dist<<" ahead with d "<<other_d<<", lane "<<other_lane<<"\n";
+                }//for i over sensor_fusion
+                
+                target_vel = lane_speed[old_lane];
+                if (lane_speed[target_lane] < target_vel){ //oops: target lane is now slower than old lane, but I'll finish the maneuver anyway
+                  target_vel = lane_speed[target_lane];
+                }
+                cout <<" old_lane is "<<old_lane<<" target_lane is "<<target_lane<<" ref_lane is "<<ref_lane<<"\n";
+                for (int i = 0; i < lane_clear.size(); i++){
+                  cout <<"  lane "<<i<<" clear status is "<<lane_clear[i]<<" and its speed is "<<lane_speed[i]<<"\n";
+                  if(
+                     change_dir == 0         &&  //not already changing lanes
+                     abs(old_lane - i) < 1.1 &&  //prospective lane next to current lane
+                     lane_clear[i]           &&  //prospective lane is clear
+                     lane_speed[i] > target_vel) //prosepective lane is faster than current lane
+                    {
+                    target_lane = i;
+                    change_dir = target_lane - old_lane;
+                    cout <<"    changed target_lane to "<<target_lane<<"\n";
+                  }
+                  //target_vel = lane_speed[i];//removed: don't speed up until lane change is complete
+                }//for i over lane count
+        
+                  
+                //ADJUST SPEED BASED ON TARGET SPEED
+                // if (way_too_close[old_lane] || way_too_close[target_lane]) { 
+                //   ref_accl_step = -1 * max_accl_step;
+                // }else{
+                //   ref_accl_step = max_accl_step * (target_vel - ref_vel) / (1.0 * target_vel); //scale acceleration based on difference in speed
+                //   if (fabs(ref_accl_step) > max_accl_step){
+                //     ref_accl_step = max_accl_step * ref_accl_step / fabs(ref_accl_step);
+                //   }
+                // }
+                // ref_vel += ref_accl_step;
+
+                // double ref_vel_dist = time_step * ref_vel;
+                // cout<<"    set ref_vel,ref_vel_dist to "<<ref_vel<<","<<ref_vel_dist<<"\n";
+                if (way_too_close[old_lane] || way_too_close[target_lane]) { 
+                  ref_accl_step = -1 * max_accl_step;
+                }else{
+                  ref_accl_step = max_accl_step * (target_vel - ref_vel) / (1.0 * target_vel); //scale acceleration based on difference in speed
+                  if (fabs(ref_accl_step) > max_accl_step){
+                    ref_accl_step = max_accl_step * ref_accl_step / fabs(ref_accl_step);
+                  }
+                }
+                ref_vel += ref_accl_step;
+                double ref_vel_dist = time_step * ref_vel;
+                cout<<"    set ref_vel,ref_vel_dist to "<<ref_vel<<","<<ref_vel_dist<<" since target_vel,way_too_close are "<<target_vel<<","<<way_too_close[old_lane]<<","<<way_too_close[target_lane]<<"\n";
+                
+                //advance ref_lane
+                ref_lane += change_dir * 0.05;
+                if ((ref_lane - old_lane) * change_dir > 1.0){
+                  cout <<"    lane change completed \n";
+                  ref_lane = target_lane;
+                  old_lane = target_lane;
+                  change_dir = 0;
+                }
+                
+                //INITIALIZE PATH, OR COPY PREVIOUS PATH
+                vector<double> ptsx;
+                vector<double> ptsy;
+                double ref_x = car_x;
+                double ref_y = car_y;
+                double ref_yaw = deg2rad(car_yaw);
+                if(prev_size < 2){ //use car's current state for reference
+                  double ref_x_prev = car_x - 1e-2 * cos(deg2rad(car_yaw)); 
+                  double ref_y_prev = car_y - 1e-2 * sin(deg2rad(car_yaw));
+                  ptsx.push_back(ref_x_prev);
+                  ptsy.push_back(ref_y_prev);
+                  ptsx.push_back(ref_x);
+                  ptsy.push_back(ref_y);
+                  cout<<"  computed reference points from scratch of "<<ref_x_prev<<","<<ref_y_prev<<" and "<<ref_x<<","<<ref_y<<"\n";
+                }else{
+                  //use tail end of previous path
+                  ref_x = previous_path_x[prev_size-1];
+                  ref_y = previous_path_y[prev_size-1];
+                  //use beginning of previous path
+                  //ref_x = previous_path_x[1];
+                  //ref_y = previous_path_y[1];
+                  double ref_x_prev = previous_path_x[0];
+                  double ref_y_prev = previous_path_y[0];
+                  ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
+
+                  ptsx.push_back(ref_x_prev);
+                  ptsx.push_back(ref_x);
+                  ptsy.push_back(ref_y_prev);
+                  ptsy.push_back(ref_y);
+                  cout<<"  using prev. path's reference points of "<<ref_x_prev<<","<<ref_y_prev<<" and "<<ref_x<<","<<ref_y<<"\n";
+                }
+
+                //COMPUTE NEW PATH
+                //use Fernet coordinates for finding waypoints for spline
+                double effective_lane = car_d / lane_width - 0.5;
+                for (int i = 1; i <= 3; i++){
+                  //step must exceed end of previous path- more than 23 meters when traveling 50mph.  use 30 meter steps
+                  //will spend 120m to change lanes
+                  double dist_ahead = i * 40.0;
+                  //double lane_ahead = effective_lane + (target_lane - old_lane) * dist_ahead / 120.0;
+                  //lane_ahead = (lane_ahead - old_lane) * (target_lane - old_lane) > 1 ? target_lane : lane_ahead;
+                  //double d_ahead = (lane_ahead + 0.5) * lane_width;
+                  double d_ahead = (ref_lane + 0.5) * lane_width;
+                  vector<double> next_wp = getXY(car_s+dist_ahead,d_ahead,map_waypoints_s,map_waypoints_x,map_waypoints_y);
+                  cout <<"  computed spline waypoint "<<next_wp[0]<<","<<next_wp[1]<<"\n";
+                  ptsx.push_back(next_wp[0]);
+                  ptsy.push_back(next_wp[1]);
+
+                }
+                for (int i=0; i<ptsx.size();i++){
+                  double shift_x = ptsx[i]-ref_x;
+                  double shift_y = ptsy[i]-ref_y;
+                  ptsx[i] = shift_x*cos(0.0-ref_yaw) - shift_y*sin(0.0-ref_yaw);
+                  ptsy[i] = shift_x*sin(0.0-ref_yaw) + shift_y*cos(0.0-ref_yaw);
+                  cout<<"    converted waypoint to local coordinate of "<<ptsx[i]<<","<<ptsy[i]<<"\n";
+                }
+
+                tk::spline spline;
+                spline.set_points(ptsx,ptsy);
+
+                for(int i = 0; i < prev_size; i++){
+                  next_x_vals.push_back(previous_path_x[i]);
+                  next_y_vals.push_back(previous_path_y[i]);
+                }
+                double target_x = 30.0; //meters out to look when picking points for spline
+                double target_y = spline(target_x);
+                double target_dist = distance(0.0,0.0,target_x,target_y);
+                double target_fact = target_dist / target_x;
+
+                //double ref_vel_dist;
+                //double iter_x = 0.0;
+                for (int i = 1; i <= 50 - prev_size; i++){
+                  
+                  // if (way_too_close[old_lane] || way_too_close[target_lane]) { 
+                  //   ref_accl_step = -1 * max_accl_step;
+                  // }else{
+                  //   ref_accl_step = max_accl_step * (target_vel - ref_vel) / (1.0 * target_vel); //scale acceleration based on difference in speed
+                  //   if (fabs(ref_accl_step) > max_accl_step){
+                  //     ref_accl_step = max_accl_step * ref_accl_step / fabs(ref_accl_step);
+                  //   }
+                  // }
+                  // ref_vel += ref_accl_step;
+                  // ref_vel_dist = time_step * ref_vel;
+
+                  //iter_x += ref_vel_dist/target_fact; //coordinate conversion set ref_x to 0, which is where we want to add points to
+                  double iter_x = i * ref_vel_dist / target_fact;
+                  
+                  //cout <<"    calling spline on x value "<<iter_x<<"\n";
+                  double iter_y = spline(iter_x);
+                  //cout <<"      returned "<<iter_y<<"\n";
+                  
+                  double x_point = iter_x*cos(ref_yaw) - iter_y*sin(ref_yaw) + ref_x;
+                  double y_point = iter_x*sin(ref_yaw) + iter_y*cos(ref_yaw) + ref_y;
+
+                  //cout <<"    adding x_point,y_point "<<x_point<<","<<y_point<<"\n";
+                  next_x_vals.push_back(x_point);
+                  next_y_vals.push_back(y_point);
+                }
+                //for (int j = 0; j < next_x_vals.size(); j++){
+                  //cout <<"    sending point "<<next_x_vals[j]<<","<<next_y_vals[j]<<"\n";
+                //}
+                cout <<"  finished planing path\n";
+
+                //(initial bring-up code)
+                //double dist_inc = 0.3;
+                //cout<<"requested car_x would have been "<<car_x+(dist_inc)*cos(deg2rad(car_yaw)) <<"\n";
+                //cout<<"requested car_y would have been "<<car_y+(dist_inc)*sin(deg2rad(car_yaw)) <<"\n";
+                //vector<double> xyd = getXY(car_s+dist_inc,6.0,map_waypoints_s,map_waypoints_x,map_waypoints_y);
+                //cout<<"getXY gives x of "<<xyd[0]<<"\n";
+                //cout<<"getXY gives y of "<<xyd[1]<<"\n";
+                                                                               
+                //for(int i = 0; i < 50; i++) {
+                  ////next_x_vals.push_back(car_x+(dist_inc*i)*cos(deg2rad(car_yaw)));
+                  ////next_y_vals.push_back(car_y+(dist_inc*i)*sin(deg2rad(car_yaw)));
+                  //vector<double> xy = getXY(car_s+(i+1)*dist_inc,6.0,map_waypoints_s,map_waypoints_x,map_waypoints_y);
+                  //next_x_vals.push_back(xy[0]);
+                  //next_y_vals.push_back(xy[1]);
+                //}
+
+
+                msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
           	auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+                cout<<"sent message to simulator\n";
         }
       } else {
         // Manual driving
         std::string msg = "42[\"manual\",{}]";
         ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
       }
+      cout <<"outside 1\n";
     }
+    cout <<"outside 2\n";
   });
 
   // We don't need this since we're not using HTTP but if it's removed the

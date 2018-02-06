@@ -254,8 +254,8 @@ int main() {
   int old_lane    = 1; //lanes are 0,1,2 from left to right.  We start in lane 1
   double ref_lane = 1.0; //tracks progress of lane change
   int target_lane = 1;  //lane being moved into.  target_lane != old_lane denotes a lane changing state
-  vector<double> d_lane_change; //d values to be used during a lane change
-  h.onMessage([&ref_lane,&old_lane,&target_lane,&ref_vel,&d_lane_change,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,uWS::OpCode opCode) {
+  vector<double> d_path(1000,6.0); //d values to be used during a lane change.  Can set to large initial size; will be erased when lane change starts
+  h.onMessage([&ref_lane,&old_lane,&target_lane,&ref_vel,&d_path,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -298,7 +298,7 @@ int main() {
 
                 //useful values for computation
                 int num_points = 25;             //number of points to send in each response.  Since keeping all previous points, don't want this to be too large and slow reaction time
-                double lane_change_time = 1.0;   //time to spend changing lanes
+                double lane_change_time = 5.0;   //time to spend changing lanes
                 double lane_width = 4.0;         //lanes are 4 meters wide
                 double time_step = 0.02;         //timestep is 0.02 seconds
                 double max_vel = 49.5 * 0.44704; //mph, convert to m/s
@@ -307,13 +307,22 @@ int main() {
                 double ref_accl_step = 0.0;
                 int change_dir = target_lane - old_lane;
                 int prev_size = previous_path_x.size();
+                int steps_advanced = num_points - prev_size;
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
                 int num_lane_change_points = (int) lane_change_time / time_step;
+                int num_spline_points = 1000; //enough to cover longest spline
 
                 cout <<"car_x,car_y are "<<car_x<<","<<car_y<<", ref_vel is "<<ref_vel<<", change_dir is "<<change_dir<<"\n";
                 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+
+                d_path.erase(d_path.begin(),d_path.begin()+steps_advanced);
+                //fill up d_lange_change again, in case it was reinitialized, so that it can always be used for spline
+                while (d_path.size() < num_spline_points){
+                  d_path.push_back(lane_width * (target_lane+0.5));
+                }
+
 
                 //PREDICT LOCATION OF ALL OTHER CARS AT OUR REFERENCE TIME POINT
                 double ref_s = car_s;
@@ -321,10 +330,12 @@ int main() {
                   ref_s = end_path_s;
                 }
                 double pred_s = ref_s + ref_vel * lane_change_time; //prediction of where our car will be at the end of lane change time
+                double pred2_s = ref_s + ref_vel * 2 * lane_change_time; //prediction of where our car will be at the end of 2xlane change time (for double lane change)
                 vector<double>others_id;
                 vector<double>others_s;
                 vector<double>others_ref_s;
                 vector<double>others_pred_s;
+                vector<double>others_pred2_s;
                 vector<double> others_ref_d;
                 vector<double> others_speed;
                 for (int i = 0; i < sensor_fusion.size(); i++){ //iterate through all the other cars reported
@@ -341,12 +352,15 @@ int main() {
                   others_ref_s.push_back(other_ref_s);
                   double other_pred_s = other_ref_s +(lane_change_time * other_speed);
                   others_pred_s.push_back(other_pred_s);
+                  double other_pred2_s = other_ref_s +(2 * lane_change_time * other_speed);
+                  others_pred2_s.push_back(other_pred2_s);
                   others_ref_d.push_back(other_d); //assume other car isn't moving laterally; we'll see how well this holds up
                   others_speed.push_back(other_speed);
                 }
 
                 //CHECK LANES FOR CLOSE CARS; SET SPEED FOR EACH LANE; MARK IF SAFE TO ENTER LANE
                 vector<bool> lane_clear(3,true);
+                vector<bool> lane_clear2(3,true);
                 vector<double> lane_speed(3,max_vel);
                 vector<double> lane_cur_speed(3,max_vel);
                 vector<bool> way_too_close(3,false);
@@ -355,12 +369,14 @@ int main() {
                   double other_s = others_s[i];
                   double other_ref_s = others_ref_s[i];
                   double other_pred_s = others_pred_s[i];
+                  double other_pred2_s = others_pred2_s[i];
                   double other_speed = others_speed[i];
                   int other_lane = (int)(other_d/lane_width);
                   double other_dist = other_s - car_s;
                   double other_ref_dist = other_ref_s - ref_s;
                   double other_pred_dist = other_pred_s - pred_s;
-                  if(other_ref_dist > 0.0 && other_ref_dist < 120.0 && lane_speed[other_lane] > other_speed){
+                  double other_pred2_dist = other_pred2_s - pred2_s;
+                  if(other_ref_dist > 0.0 && other_ref_dist < 80.0 && lane_speed[other_lane] > other_speed){
                     lane_speed[other_lane] = other_speed;
                   }
                   if(other_ref_dist > 0.0 && other_ref_dist < 30.0 && lane_cur_speed[other_lane] > other_speed){
@@ -372,39 +388,72 @@ int main() {
                   if((other_ref_dist > -15.0 && other_ref_dist < 15.0) || (other_pred_dist > -15.0 && other_pred_dist < 15.0)){
                     lane_clear[other_lane] = false;
                   }
+                  if((other_pred_dist > -15.0 && other_pred_dist < 15.0) || (other_pred2_dist > -15.0 && other_pred2_dist < 15.0)){
+                    lane_clear2[other_lane] = false;
+                  }
                   //cout <<"  detected other car "<<others_id[i]<<" "<<other_dist<<" ahead with d "<<other_d<<", lane "<<other_lane<<"\n";
                 }//for i over sensor_fusion
                 double target_vel = max_vel;
                 if (lane_cur_speed[old_lane] < target_vel){ //decide which lane to be in by speed over long distance, but only reduce speed when closer
                   target_vel = lane_cur_speed[old_lane];
                 }
-                cout <<" old_lane is "<<old_lane<<" target_lane is "<<target_lane<<" ref_lane is "<<ref_lane<<"\n";
+                cout <<" old_lane/speed is "<<old_lane<<"/"<<lane_speed[old_lane]<<" target_lane/speed is "<<target_lane<<"/"<<lane_speed[target_lane]<<" ref_lane is "<<ref_lane<<"\n";
                 for (int i = 0; i < lane_clear.size(); i++){
                   cout <<"  lane "<<i<<" clear status is "<<lane_clear[i]<<" and its speed is "<<lane_speed[i]<<"\n";
                   if(
-                     change_dir == 0            &&  //not already changing lanes
-                     lane_clear[i]              &&  //prospective lane is clear
-                     lane_speed[i] > target_vel &&  //prosepective lane is faster than current lane
-                     abs(old_lane - i) < 1.1        //prospective lane next to current lane
+                     change_dir == 0                      &&  //not already changing lanes
+                     lane_clear[i]                        &&  //prospective lane is clear
+                     lane_speed[i] > lane_speed[target_lane] + 1.0 &&  //prosepective lane is faster than current lane, and by enough to justify changing
+                     abs(old_lane - i) < 1.1                  //prospective lane next to current lane
                      ){
                     target_lane = i;
                     change_dir = target_lane - old_lane;
-                    d_lane_change = compute_lane_change(old_lane,target_lane,lane_width,num_lane_change_points);
+                    d_path.erase(d_path.begin()+prev_size,d_path.end());
+                    vector<double> d_lane_change = compute_lane_change(old_lane,target_lane,lane_width,num_lane_change_points);
+                    d_path.insert(d_path.end(),d_lane_change.begin(),d_lane_change.end());
                     cout <<"    changed target_lane to "<<target_lane<<"\n";
                   }//meet conditions to change lanes
                 }//for i over lane count
+
+                //consider a double lane change
+                int lane2 = 2 - old_lane;
+                if (change_dir == 0 &&  //check to see if 2 lanes over is faster and both lanes are clear; if so, change to lane 1
+                    (old_lane == 0 || old_lane == 2) &&
+                    lane_clear[1] &&
+                    lane_clear2[lane2] &&
+                    lane_speed[lane2] > lane_speed[target_lane] + 2.0
+                    ){
+                  target_lane = 1;
+                  change_dir = target_lane - old_lane;
+                  d_path.erase(d_path.begin()+prev_size,d_path.end());
+                  vector<double> d_lane_change = compute_lane_change(old_lane,target_lane,lane_width,num_lane_change_points);
+                  d_path.insert(d_path.end(),d_lane_change.begin(),d_lane_change.end());
+                  cout <<"    changed target_lane to "<<target_lane<<" in preparation of double lane change\n";
+                }//if <check for starting double lane change>
+                    
                 if (lane_cur_speed[target_lane] < target_vel){ //oops: target lane is now slower than old lane, but I'll finish the maneuver anyway
                   target_vel = lane_cur_speed[target_lane];
                   cout <<"    target_vel reduced to "<<target_vel<<" due to target_lane "<<target_lane<<" having a slower speed\n";
                 } 
-               
+                d_path.erase(d_path.begin(),d_path.begin()+steps_advanced);
+                //fill up d_lange_change again, in case it was reinitialized, so that it can always be used for spline
+                while (d_path.size() < 2 * num_spline_points){
+                  d_path.push_back(lane_width * (target_lane+0.5));
+                }
                 //advance ref_lane
-                ref_lane += change_dir * (1.0 / (float)num_lane_change_points);
-                if ((ref_lane - old_lane) * change_dir > 1.0){
-                  cout <<"    lane change completed \n";
-                  ref_lane = target_lane;
-                  old_lane = target_lane;
-                  change_dir = 0;
+                if(change_dir != 0){
+                  ref_lane += change_dir * ((float) steps_advanced / (float)num_lane_change_points);
+                  if ((ref_lane - old_lane) * change_dir > 1.0 ){
+                    ref_lane = target_lane;
+                  }
+                  double lane_error = car_d / lane_width - 0.5 - target_lane;
+                  cout <<"lane_error is "<<lane_error<<"\n";
+                  if(lane_error > -0.1 && lane_error < 0.1){
+                    cout <<"    lane change completed \n";
+                    ref_lane = target_lane;
+                    old_lane = target_lane;
+                    change_dir = 0;
+                  }
                 }
                 
                 //INITIALIZE PATH, OR COPY PREVIOUS PATH
@@ -442,10 +491,19 @@ int main() {
                 //COMPUTE NEW PATH
                 //use Fernet coordinates for finding waypoints for spline
                 double effective_lane = car_d / lane_width - 0.5;
-                for (int i = 1; i <= 3; i++){
-                  //step must exceed end of previous path- more than 23 meters when traveling 50mph.  use 30 meter steps
-                  double dist_ahead = i * 40.0;
-                  double d_ahead = (ref_lane + 0.5) * lane_width;
+                for (int i = 1; i <= 5; i++){
+                  //first step must exceed end of previous path
+                  double dist_ahead = i * 30.0;
+                  //double d_ahead = (ref_lane + 0.5) * lane_width;
+                  int num_points_ahead;
+                  if (ref_vel > 10.0){
+                    num_points_ahead = (int) (dist_ahead / ref_vel / time_step);
+                  }else{
+                    num_points_ahead = i * 100;
+                  }
+                  cout <<"      num_points_ahead is "<<num_points_ahead <<" from dist/vel/step "<<dist_ahead<<"/"<<ref_vel<<"/"<<time_step<<"\n";
+                  double d_ahead = d_path[num_points_ahead];
+                  cout <<"      d_ahead is "<<d_ahead<<"\n";
                   vector<double> next_wp = getXY(car_s+dist_ahead,d_ahead,map_waypoints_s,map_waypoints_x,map_waypoints_y);
                   //cout <<"  computed spline waypoint "<<next_wp[0]<<","<<next_wp[1]<<"\n";
                   ptsx.push_back(next_wp[0]);

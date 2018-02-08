@@ -452,7 +452,7 @@ int main() {
                     //cout <<"    lane change completed \n";
                     old_lane = target_lane;
                     change_dir = 0;
-                    cout <<"    lane change complete; now in lane "<<old_lane<<"\n";
+                    //cout <<"    lane change complete; now in lane "<<old_lane<<"\n";
                   }
                 }
                 
